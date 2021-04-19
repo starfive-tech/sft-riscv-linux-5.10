@@ -1,1 +1,1 @@
-# sft-riscvpi-linux-5.10
+# sft-riscv-linux-5.10
