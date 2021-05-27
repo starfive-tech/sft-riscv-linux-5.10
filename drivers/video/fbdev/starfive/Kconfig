@@ -8,5 +8,9 @@ config FB_STARFIVE_HDMI_ADV7513
 	depends on FB_STARFIVE
 	help
 	  Say Y here if you want to have support for ADV7513 displayer
+config FB_STARFIVE_HDMI_TDA998X
+	bool "HDMI TDA998X displayer support"
+	help
+	  Say Y here if you want to have support for TDA998X displayer
 
 endmenu
