@@ -123,7 +123,7 @@ static int vin_frame_complete_notify(struct notifier_block *nb,
 {
 	struct vin_params *psy = v;
 	struct sf_fb_data *sf_dev = stf_dev;
-	unsigned int address;
+	unsigned int *address;
 	unsigned int u_addr, v_addr, size;
 	unsigned int y_rgb_offset, u_offset, v_offset;
 
@@ -144,8 +144,8 @@ static int vin_frame_complete_notify(struct notifier_block *nb,
 	        v_offset = 0;
 		} else if (COLOR_YUV420_NV21 == sf_dev->pp[sf_dev->pp_conn_lcdc].src.format) {
 			size = sf_dev->display_info.xres * sf_dev->display_info.yres;
-			u_addr = address + size + 1;
-			v_addr = address + size;
+			u_addr = *address + size + 1;
+			v_addr = *address + size;
 			y_rgb_offset = 0;
 			u_offset = 0;
 			v_offset = size;
@@ -153,7 +153,7 @@ static int vin_frame_complete_notify(struct notifier_block *nb,
 			dev_err(sf_dev->dev, "format %d not SET\n", sf_dev->pp[sf_dev->pp_conn_lcdc].src.format);
 			return -EINVAL;
 		}
-		pp_srcAddr_next(sf_dev, sf_dev->pp_conn_lcdc, address, u_addr, v_addr);
+		pp_srcAddr_next(sf_dev, sf_dev->pp_conn_lcdc, *address, u_addr, v_addr);
 		pp_srcOffset_cfg(sf_dev, sf_dev->pp_conn_lcdc, y_rgb_offset, u_offset, v_offset);
 		//pp_run(sf_dev, sf_dev->pp_conn_lcdc, PP_RUN);
 	}
