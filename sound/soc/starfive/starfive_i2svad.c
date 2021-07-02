@@ -1,15 +1,23 @@
-/*
- * ALSA SoC Synopsys I2S Audio Layer
- *
- * sound/soc/dwc/designware_i2s.c
- *
- * Copyright (C) 2010 ST Microelectronics
- * Rajeev Kumar <rajeevkumar.linux@gmail.com>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2. This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- */
+/**
+  ******************************************************************************
+  * @file  sf_i2svad.c
+  * @author  StarFive Technology
+  * @version  V1.0
+  * @date  06/02/2021
+  * @brief
+  ******************************************************************************
+  * @copy
+  *
+  * THE PRESENT SOFTWARE WHICH IS FOR GUIDANCE ONLY AIMS AT PROVIDING CUSTOMERS
+  * WITH CODING INFORMATION REGARDING THEIR PRODUCTS IN ORDER FOR THEM TO SAVE
+  * TIME. AS A RESULT, STARFIVE SHALL NOT BE HELD LIABLE FOR ANY
+  * DIRECT, INDIRECT OR CONSEQUENTIAL DAMAGES WITH RESPECT TO ANY CLAIMS ARISING
+  * FROM THE CONTENT OF SUCH SOFTWARE AND/OR THE USE MADE BY CUSTOMERS OF THE
+  * CODING INFORMATION CONTAINED HEREIN IN CONNECTION WITH THEIR PRODUCTS.
+  *
+  * <h2><center>&copy; COPYRIGHT 20120 Shanghai StarFive Technology Co., Ltd. </center></h2>
+  */
+
 
 #include <linux/clk.h>
 #include <linux/device.h>
@@ -24,8 +32,234 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 #include <sound/dmaengine_pcm.h>
-#include "local.h"
+#include "starfive_i2svad.h"
+#include <linux/kthread.h>
 
+
+/* vad control function*/
+static void vad_start(struct vad_params *vad)
+{
+	regmap_update_bits(vad->vad_map, VAD_MEM_SW, 
+			VAD_MEM_SW_MASK, VAD_MEM_SW_TO_VAD);
+	regmap_update_bits(vad->vad_map, VAD_SW, 
+			VAD_SW_MASK, VAD_SW_VAD_XMEM_ENABLE|VAD_SW_ADC_ENABLE);
+	regmap_update_bits(vad->vad_map, VAD_SPINT_EN, 
+			VAD_SPINT_EN_MASK, VAD_SPINT_EN_ENABLE);
+	regmap_update_bits(vad->vad_map, VAD_SLINT_EN, 
+			VAD_SLINT_EN_MASK, VAD_SLINT_EN_ENABLE);
+}
+
+static void vad_stop(struct vad_params *vad)
+{
+	regmap_update_bits(vad->vad_map, VAD_SPINT_EN, 
+			VAD_SPINT_EN_MASK, VAD_SLINT_EN_DISABLE);
+	regmap_update_bits(vad->vad_map, VAD_SLINT_EN, 
+			VAD_SLINT_EN_MASK, VAD_SLINT_EN_DISABLE);
+	regmap_update_bits(vad->vad_map, VAD_SW, 
+			VAD_SW_MASK, VAD_SW_VAD_XMEM_DISABLE|VAD_SW_ADC_DISABLE);
+	regmap_update_bits(vad->vad_map, VAD_MEM_SW, 
+			VAD_MEM_SW_MASK, VAD_MEM_SW_TO_AXI);
+}
+
+static void vad_status(struct vad_params *vad)
+{
+	u32 sp_value,sp_en;
+	u32 sl_value,sl_en;
+	
+	regmap_read(vad->vad_map, VAD_SPINT,&sp_value);
+	regmap_read(vad->vad_map, VAD_SPINT_EN,&sp_en);
+	if (sp_value&sp_en){
+		regmap_update_bits(vad->vad_map, VAD_SPINT_CLR,
+				VAD_SPINT_CLR_MASK, VAD_SPINT_CLR_VAD_SPINT);
+		vad->vstatus = VAD_STATUS_SPINT;
+		vad_stop(vad);
+		vad_start(vad);
+	}
+	
+	regmap_read(vad->vad_map, VAD_SLINT,&sl_value);
+	regmap_read(vad->vad_map, VAD_SLINT_EN,&sl_en);
+	if (sl_value&sl_en){
+		regmap_update_bits(vad->vad_map, VAD_SLINT_CLR, 
+				VAD_SLINT_CLR_MASK, VAD_SLINT_CLR_VAD_SLINT);
+		vad->vstatus = VAD_STATUS_SLINT;
+	}
+}
+
+
+static int vad_trigger(struct vad_params *vad,int cmd)
+{
+	int ret = 0;
+	
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if(vad->vswitch)
+		{
+			vad_start(vad);
+		}
+		break;
+
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		vad_stop(vad);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+	return ret;
+}
+
+static void vad_init(struct vad_params *vad)
+{
+	/* left_margin */
+	regmap_update_bits(vad->vad_map, VAD_LEFT_MARGIN, 
+			VAD_LEFT_MARGIN_MASK, 0x0);
+	/* right_margin */
+	regmap_update_bits(vad->vad_map, VAD_RIGHT_MARGIN, 
+			VAD_RIGHT_MARGIN_MASK, 0x0);
+	/*low-energy transition range threshold ——NL*/
+	regmap_update_bits(vad->vad_map, VAD_N_LOW_CONT_FRAMES, 
+			VAD_N_LOW_CONT_FRAMES_MASK, 0x3);
+	/* low-energy transition range */
+	regmap_update_bits(vad->vad_map, VAD_N_LOW_SEEK_FRAMES, 
+			VAD_N_LOW_SEEK_FRAMES_MASK, 0x8);
+	/* high-energy transition range threshold——NH */
+	regmap_update_bits(vad->vad_map, VAD_N_HIGH_CONT_FRAMES, 
+			VAD_N_HIGH_CONT_FRAMES_MASK, 0x5);
+	/* high-energy transition range */
+	regmap_update_bits(vad->vad_map, VAD_N_HIGH_SEEK_FRAMES, 
+			VAD_N_HIGH_SEEK_FRAMES_MASK, 0x1E);
+	/*low-energy voice range threshold——NVL*/
+	regmap_update_bits(vad->vad_map, VAD_N_SPEECH_LOW_HIGH_FRAMES, 
+			VAD_N_SPEECH_LOW_HIGH_FRAMES_MASK, 0x2);
+	/*low-energy voice range*/
+	regmap_update_bits(vad->vad_map, VAD_N_SPEECH_LOW_SEEK_FRAMES, 
+			VAD_N_SPEECH_LOW_SEEK_FRAMES_MASK, 0x12);
+	/*mean silence frame range*/
+	regmap_update_bits(vad->vad_map, VAD_MEAN_SIL_FRAMES, 
+			VAD_MEAN_SIL_FRAMES_MASK, 0xA);
+	/*low-energy threshold scaling factor,12bit(0~0xFFF)*/
+	regmap_update_bits(vad->vad_map, VAD_N_ALPHA, 
+			VAD_N_ALPHA_MASK, 0x1A);
+	/*high-energy threshold scaling factor,12bit(0~0xFFF)*/
+	regmap_update_bits(vad->vad_map, VAD_N_BETA, 
+			VAD_N_BETA_MASK, 0x34);
+	regmap_update_bits(vad->vad_map, VAD_LEFT_WD, 
+			VAD_LEFT_WD_MASK, VAD_LEFT_WD_BIT_15_0);
+	regmap_update_bits(vad->vad_map, VAD_RIGHT_WD, 
+			VAD_RIGHT_WD_MASK, VAD_RIGHT_WD_BIT_15_0);
+	regmap_update_bits(vad->vad_map, VAD_LR_SEL, 
+			VAD_LR_SEL_MASK, VAD_LR_SEL_L);
+	regmap_update_bits(vad->vad_map, VAD_STOP_DELAY, 
+			VAD_STOP_DELAY_MASK, VAD_STOP_DELAY_0_SAMPLE);
+	regmap_update_bits(vad->vad_map, VAD_ADDR_START, 
+			VAD_ADDR_START_MASK, 0x0);
+	regmap_update_bits(vad->vad_map, VAD_ADDR_WRAP, 
+			VAD_ADDR_WRAP_MASK, 0x2000);
+	regmap_update_bits(vad->vad_map, VAD_MEM_SW, 
+			VAD_MEM_SW_MASK, VAD_MEM_SW_TO_AXI);
+	regmap_update_bits(vad->vad_map, VAD_SPINT_CLR, 
+			VAD_SPINT_CLR_MASK, VAD_SPINT_CLR_VAD_SPINT);
+	regmap_update_bits(vad->vad_map, VAD_SLINT_CLR, 
+			VAD_SLINT_CLR_MASK, VAD_SLINT_CLR_VAD_SLINT);
+}
+
+
+static int vad_switch_info(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 1;
+
+	return 0;
+}
+
+static int vad_switch_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct i2svad_dev *dev = snd_soc_component_get_drvdata(component);
+
+	ucontrol->value.integer.value[0] = dev->vad.vswitch;
+
+	return 0;
+}
+
+static int vad_switch_put(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct i2svad_dev *dev = snd_soc_component_get_drvdata(component);
+	int val;
+
+	val = ucontrol->value.integer.value[0];
+	if (val && !dev->vad.vswitch) {
+		dev->vad.vswitch = true;
+	} else if (!val && dev->vad.vswitch) {
+		dev->vad.vswitch = false;
+		vad_stop(&(dev->vad));
+	}
+
+	return 0;
+}
+
+
+static int vad_status_info(struct snd_kcontrol *kcontrol,
+				    struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 2;
+
+	return 0;
+}
+
+static int vad_status_get(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
+	struct i2svad_dev *dev = snd_soc_component_get_drvdata(component);
+
+	ucontrol->value.integer.value[0] = dev->vad.vstatus;
+	dev->vad.vstatus = VAD_STATUS_NORMAL;
+
+	return 0;
+}
+
+
+#define SOC_VAD_SWITCH_DECL(xname) \
+{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = xname, \
+	.info = vad_switch_info, .get = vad_switch_get, \
+	.put = vad_switch_put, }
+
+#define SOC_VAD_STATUS_DECL(xname) \
+{	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = xname, \
+	.info = vad_status_info, .get = vad_status_get,  }
+
+
+static const struct snd_kcontrol_new vad_snd_controls[] = {
+	SOC_VAD_SWITCH_DECL("vad switch"),
+	SOC_VAD_STATUS_DECL("vad status"),	
+};
+
+static int vad_probe(struct snd_soc_component *component)
+{
+	struct i2svad_dev *priv = snd_soc_component_get_drvdata(component);
+
+	snd_soc_component_init_regmap(component, priv->vad.vad_map);
+	snd_soc_add_component_controls(component, vad_snd_controls,
+				     ARRAY_SIZE(vad_snd_controls));
+
+	return 0;
+}
+
+/* i2s control function*/
 static inline void i2s_write_reg(void __iomem *io_base, int reg, u32 val)
 {
 	writel(val, io_base + reg);
@@ -36,33 +270,33 @@ static inline u32 i2s_read_reg(void __iomem *io_base, int reg)
 	return readl(io_base + reg);
 }
 
-static inline void i2s_disable_channels(struct dw_i2s_dev *dev, u32 stream)
+static inline void i2s_disable_channels(struct i2svad_dev *dev, u32 stream)
 {
 	u32 i = 0;
 
 	if (stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		for (i = 0; i < 4; i++)
+		for (i = 0; i < ALL_CHANNEL_NUM; i++)
 			i2s_write_reg(dev->i2s_base, TER(i), 0);
 	} else {
-		for (i = 0; i < 4; i++)
+		for (i = 0; i < ALL_CHANNEL_NUM; i++)
 			i2s_write_reg(dev->i2s_base, RER(i), 0);
 	}
 }
 
-static inline void i2s_clear_irqs(struct dw_i2s_dev *dev, u32 stream)
+static inline void i2s_clear_irqs(struct i2svad_dev *dev, u32 stream)
 {
 	u32 i = 0;
 
 	if (stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		for (i = 0; i < 4; i++)
+		for (i = 0; i < ALL_CHANNEL_NUM; i++)
 			i2s_read_reg(dev->i2s_base, TOR(i));
 	} else {
-		for (i = 0; i < 4; i++)
+		for (i = 0; i < ALL_CHANNEL_NUM; i++)
 			i2s_read_reg(dev->i2s_base, ROR(i));
 	}
 }
 
-static inline void i2s_disable_irqs(struct dw_i2s_dev *dev, u32 stream,
+static inline void i2s_disable_irqs(struct i2svad_dev *dev, u32 stream,
 				    int chan_nr)
 {
 	u32 i, irq;
@@ -80,7 +314,7 @@ static inline void i2s_disable_irqs(struct dw_i2s_dev *dev, u32 stream,
 	}
 }
 
-static inline void i2s_enable_irqs(struct dw_i2s_dev *dev, u32 stream,
+static inline void i2s_enable_irqs(struct i2svad_dev *dev, u32 stream,
 				   int chan_nr)
 {
 	u32 i, irq;
@@ -100,12 +334,12 @@ static inline void i2s_enable_irqs(struct dw_i2s_dev *dev, u32 stream,
 
 static irqreturn_t i2s_irq_handler(int irq, void *dev_id)
 {
-	struct dw_i2s_dev *dev = dev_id;
+	struct i2svad_dev *dev = dev_id;
 	bool irq_valid = false;
 	u32 isr[4];
 	int i;
 
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < ALL_CHANNEL_NUM; i++)
 		isr[i] = i2s_read_reg(dev->i2s_base, ISR(i));
 
 	i2s_clear_irqs(dev, SNDRV_PCM_STREAM_PLAYBACK);
@@ -117,7 +351,7 @@ static irqreturn_t i2s_irq_handler(int irq, void *dev_id)
 		 * NOTE: Only two channels supported
 		 */
 		if ((isr[i] & ISR_TXFE) && (i == 0) && dev->use_pio) {
-			dw_pcm_push_tx(dev);
+			i2svad_pcm_push_tx(dev);
 			irq_valid = true;
 		}
 
@@ -126,7 +360,7 @@ static irqreturn_t i2s_irq_handler(int irq, void *dev_id)
 		 * NOTE: Only two channels supported
 		 */
 		if ((isr[i] & ISR_RXDA) && (i == 0) && dev->use_pio) {
-			dw_pcm_pop_rx(dev);
+			i2svad_pcm_pop_rx(dev);
 			irq_valid = true;
 		}
 
@@ -143,13 +377,15 @@ static irqreturn_t i2s_irq_handler(int irq, void *dev_id)
 		}
 	}
 
+	vad_status(&(dev->vad));
+
 	if (irq_valid)
 		return IRQ_HANDLED;
 	else
 		return IRQ_NONE;
 }
 
-static void i2s_start(struct dw_i2s_dev *dev,
+static void i2s_start(struct i2svad_dev *dev,
 		      struct snd_pcm_substream *substream)
 {
 	struct i2s_clk_config_data *config = &dev->config;
@@ -165,7 +401,7 @@ static void i2s_start(struct dw_i2s_dev *dev,
 	i2s_write_reg(dev->i2s_base, CER, 1);
 }
 
-static void i2s_stop(struct dw_i2s_dev *dev,
+static void i2s_stop(struct i2svad_dev *dev,
 		struct snd_pcm_substream *substream)
 {
 
@@ -186,8 +422,9 @@ static void i2s_stop(struct dw_i2s_dev *dev,
 static int dw_i2s_startup(struct snd_pcm_substream *substream,
 		struct snd_soc_dai *cpu_dai)
 {
-	struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(cpu_dai);
+	struct i2svad_dev *dev = snd_soc_dai_get_drvdata(cpu_dai);
 	union dw_i2s_snd_dma_data *dma_data = NULL;
+	
 
 	if (!(dev->capability & DWC_I2S_RECORD) &&
 			(substream->stream == SNDRV_PCM_STREAM_CAPTURE))
@@ -207,7 +444,7 @@ static int dw_i2s_startup(struct snd_pcm_substream *substream,
 	return 0;
 }
 
-static void dw_i2s_config(struct dw_i2s_dev *dev, int stream)
+static void dw_i2s_config(struct i2svad_dev *dev, int stream)
 {
 	u32 ch_reg;
 	struct i2s_clk_config_data *config = &dev->config;
@@ -236,7 +473,7 @@ static void dw_i2s_config(struct dw_i2s_dev *dev, int stream)
 static int dw_i2s_hw_params(struct snd_pcm_substream *substream,
 		struct snd_pcm_hw_params *params, struct snd_soc_dai *dai)
 {
-	struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(dai);
+	struct i2svad_dev *dev = snd_soc_dai_get_drvdata(dai);
 	struct i2s_clk_config_data *config = &dev->config;
 	int ret;
 
@@ -314,7 +551,7 @@ static void dw_i2s_shutdown(struct snd_pcm_substream *substream,
 static int dw_i2s_prepare(struct snd_pcm_substream *substream,
 			  struct snd_soc_dai *dai)
 {
-	struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(dai);
+	struct i2svad_dev *dev = snd_soc_dai_get_drvdata(dai);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		i2s_write_reg(dev->i2s_base, TXFFR, 1);
@@ -327,7 +564,7 @@ static int dw_i2s_prepare(struct snd_pcm_substream *substream,
 static int dw_i2s_trigger(struct snd_pcm_substream *substream,
 		int cmd, struct snd_soc_dai *dai)
 {
-	struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(dai);
+	struct i2svad_dev *dev = snd_soc_dai_get_drvdata(dai);
 	int ret = 0;
 
 	switch (cmd) {
@@ -348,14 +585,19 @@ static int dw_i2s_trigger(struct snd_pcm_substream *substream,
 		ret = -EINVAL;
 		break;
 	}
+	
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+	{
+		vad_trigger(&(dev->vad),cmd);
+	}
 	return ret;
 }
 
 static int dw_i2s_set_fmt(struct snd_soc_dai *cpu_dai, unsigned int fmt)
 {
-	struct dw_i2s_dev *dev = snd_soc_dai_get_drvdata(cpu_dai);
+	struct i2svad_dev *dev = snd_soc_dai_get_drvdata(cpu_dai);
 	int ret = 0;
-
+	
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
 	case SND_SOC_DAIFMT_CBM_CFM:
 		if (dev->capability & DW_I2S_SLAVE)
@@ -393,7 +635,7 @@ static const struct snd_soc_dai_ops dw_i2s_dai_ops = {
 #ifdef CONFIG_PM
 static int dw_i2s_runtime_suspend(struct device *dev)
 {
-	struct dw_i2s_dev *dw_dev = dev_get_drvdata(dev);
+	struct i2svad_dev *dw_dev = dev_get_drvdata(dev);
 
 	if (dw_dev->capability & DW_I2S_MASTER)
 		clk_disable(dw_dev->clk);
@@ -402,7 +644,7 @@ static int dw_i2s_runtime_suspend(struct device *dev)
 
 static int dw_i2s_runtime_resume(struct device *dev)
 {
-	struct dw_i2s_dev *dw_dev = dev_get_drvdata(dev);
+	struct i2svad_dev *dw_dev = dev_get_drvdata(dev);
 
 	if (dw_dev->capability & DW_I2S_MASTER)
 		clk_enable(dw_dev->clk);
@@ -411,7 +653,7 @@ static int dw_i2s_runtime_resume(struct device *dev)
 
 static int dw_i2s_suspend(struct snd_soc_component *component)
 {
-	struct dw_i2s_dev *dev = snd_soc_component_get_drvdata(component);
+	struct i2svad_dev *dev = snd_soc_component_get_drvdata(component);
 
 	if (dev->capability & DW_I2S_MASTER)
 		clk_disable(dev->clk);
@@ -420,7 +662,7 @@ static int dw_i2s_suspend(struct snd_soc_component *component)
 
 static int dw_i2s_resume(struct snd_soc_component *component)
 {
-	struct dw_i2s_dev *dev = snd_soc_component_get_drvdata(component);
+	struct i2svad_dev *dev = snd_soc_component_get_drvdata(component);
 	struct snd_soc_dai *dai;
 	int stream;
 
@@ -441,8 +683,15 @@ static int dw_i2s_resume(struct snd_soc_component *component)
 #define dw_i2s_resume	NULL
 #endif
 
+static int dw_i2svad_probe(struct snd_soc_component *component)
+{
+	vad_probe(component);
+	return 0;
+}
+
 static const struct snd_soc_component_driver dw_i2s_component = {
 	.name		= "dw-i2s",
+	.probe      = dw_i2svad_probe,
 	.suspend	= dw_i2s_suspend,
 	.resume		= dw_i2s_resume,
 };
@@ -480,7 +729,14 @@ static const u32 formats[COMP_MAX_WORDSIZE] = {
 	0
 };
 
-static int dw_configure_dai(struct dw_i2s_dev *dev,
+static const struct regmap_config sf_i2s_regmap_cfg = {
+	.reg_bits	= 32,
+	.val_bits	= 32,
+	.reg_stride	= 4,
+	.max_register	= 0x1000,
+};
+
+static int dw_configure_dai(struct i2svad_dev *dev,
 				   struct snd_soc_dai_driver *dw_i2s_dai,
 				   unsigned int rates)
 {
@@ -511,7 +767,8 @@ static int dw_configure_dai(struct dw_i2s_dev *dev,
 		dw_i2s_dai->playback.channels_min = MIN_CHANNEL_NUM;
 		dw_i2s_dai->playback.channels_max =
 				1 << (COMP1_TX_CHANNELS(comp1) + 1);
-		dw_i2s_dai->playback.formats = formats[idx];
+		//dw_i2s_dai->playback.formats = formats[idx];
+		dw_i2s_dai->playback.formats = SNDRV_PCM_FMTBIT_S16_LE;
 		dw_i2s_dai->playback.rates = rates;
 	}
 
@@ -525,7 +782,8 @@ static int dw_configure_dai(struct dw_i2s_dev *dev,
 		dw_i2s_dai->capture.channels_min = MIN_CHANNEL_NUM;
 		dw_i2s_dai->capture.channels_max =
 				1 << (COMP1_RX_CHANNELS(comp1) + 1);
-		dw_i2s_dai->capture.formats = formats[idx];
+		//dw_i2s_dai->capture.formats = formats[idx];
+		dw_i2s_dai->capture.formats = SNDRV_PCM_FMTBIT_S16_LE;
 		dw_i2s_dai->capture.rates = rates;
 	}
 
@@ -541,7 +799,7 @@ static int dw_configure_dai(struct dw_i2s_dev *dev,
 	return 0;
 }
 
-static int dw_configure_dai_by_pd(struct dw_i2s_dev *dev,
+static int dw_configure_dai_by_pd(struct i2svad_dev *dev,
 				   struct snd_soc_dai_driver *dw_i2s_dai,
 				   struct resource *res,
 				   const struct i2s_platform_data *pdata)
@@ -574,7 +832,7 @@ static int dw_configure_dai_by_pd(struct dw_i2s_dev *dev,
 	return 0;
 }
 
-static int dw_configure_dai_by_dt(struct dw_i2s_dev *dev,
+static int dw_configure_dai_by_dt(struct i2svad_dev *dev,
 				   struct snd_soc_dai_driver *dw_i2s_dai,
 				   struct resource *res)
 {
@@ -620,12 +878,12 @@ static int dw_configure_dai_by_dt(struct dw_i2s_dev *dev,
 static int dw_i2s_probe(struct platform_device *pdev)
 {
 	const struct i2s_platform_data *pdata = pdev->dev.platform_data;
-	struct dw_i2s_dev *dev;
+	struct i2svad_dev *dev;
 	struct resource *res;
 	int ret, irq;
 	struct snd_soc_dai_driver *dw_i2s_dai;
 	const char *clk_id;
-
+	
 	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
@@ -640,7 +898,15 @@ static int dw_i2s_probe(struct platform_device *pdev)
 	dev->i2s_base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(dev->i2s_base))
 		return PTR_ERR(dev->i2s_base);
-
+	
+	dev->vad.vad_base = dev->i2s_base;
+	dev->vad.vad_map = devm_regmap_init_mmio(&pdev->dev, dev->i2s_base, &sf_i2s_regmap_cfg);
+	if (IS_ERR(dev->vad.vad_map)) {
+		dev_err(&pdev->dev, "failed to init regmap: %ld\n",
+			PTR_ERR(dev->vad.vad_map));
+		return PTR_ERR(dev->vad.vad_map);
+	}
+	
 	dev->dev = &pdev->dev;
 
 	irq = platform_get_irq(pdev, 0);
@@ -688,7 +954,7 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		if (ret < 0)
 			return ret;
 	}
-
+	
 	dev_set_drvdata(&pdev->dev, dev);
 	ret = devm_snd_soc_register_component(&pdev->dev, &dw_i2s_component,
 					 dw_i2s_dai, 1);
@@ -699,7 +965,7 @@ static int dw_i2s_probe(struct platform_device *pdev)
 
 	if (!pdata) {
 		if (irq >= 0) {
-			ret = dw_pcm_register(pdev);
+			ret = i2svad_pcm_register(pdev);
 			dev->use_pio = true;
 		} else {
 			ret = devm_snd_dmaengine_pcm_register(&pdev->dev, NULL,
@@ -714,7 +980,9 @@ static int dw_i2s_probe(struct platform_device *pdev)
 		}
 	}
 
+	vad_init(&(dev->vad));
 	pm_runtime_enable(&pdev->dev);
+
 	return 0;
 
 err_clk_disable:
@@ -725,7 +993,7 @@ err_clk_disable:
 
 static int dw_i2s_remove(struct platform_device *pdev)
 {
-	struct dw_i2s_dev *dev = dev_get_drvdata(&pdev->dev);
+	struct i2svad_dev *dev = dev_get_drvdata(&pdev->dev);
 
 	if (dev->capability & DW_I2S_MASTER)
 		clk_disable_unprepare(dev->clk);
@@ -736,9 +1004,7 @@ static int dw_i2s_remove(struct platform_device *pdev)
 
 #ifdef CONFIG_OF
 static const struct of_device_id dw_i2s_of_match[] = {
-	{ .compatible = "snps,designware-i2sadc0",	 },
-	{ .compatible = "snps,designware-i2sdac0",	 },
-	//{ .compatible = "snps,designware-i2sdac1",	 },
+	{ .compatible = "sf,sf-i2svad", },
 	{},
 };
 
@@ -753,7 +1019,7 @@ static struct platform_driver dw_i2s_driver = {
 	.probe		= dw_i2s_probe,
 	.remove		= dw_i2s_remove,
 	.driver		= {
-		.name	= "designware-i2s",
+		.name	= "sf-i2svad",
 		.of_match_table = of_match_ptr(dw_i2s_of_match),
 		.pm = &dwc_pm_ops,
 	},
@@ -761,7 +1027,7 @@ static struct platform_driver dw_i2s_driver = {
 
 module_platform_driver(dw_i2s_driver);
 
-MODULE_AUTHOR("Rajeev Kumar <rajeevkumar.linux@gmail.com>");
-MODULE_DESCRIPTION("DESIGNWARE I2S SoC Interface");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:designware_i2s");
+MODULE_AUTHOR("jenny zhang <jenny.zhang@starfivetech.com>");
+MODULE_DESCRIPTION("starfive I2SVAD SoC Interface");
+MODULE_LICENSE("GPL v2");
+MODULE_ALIAS("platform:sf-i2svad");
