@@ -1,5 +1,6 @@
 config SND_STARFIVE_SPDIF
 	tristate "starfive spdif"
+	select SND_SOC_GENERIC_DMAENGINE_PCM
 	select REGMAP_MMIO
 	help
 	  Say Y or M if you want to add support for codecs attached to the

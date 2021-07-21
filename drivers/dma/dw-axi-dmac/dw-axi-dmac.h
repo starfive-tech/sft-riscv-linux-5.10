@@ -46,10 +46,17 @@ struct axi_dma_chan {
 	struct axi_dma_chip		*chip;
 	void __iomem			*chan_regs;
 	u8				id;
+	u8				hw_handshake_num;
 	atomic_t			descs_allocated;
 
+	struct dma_pool			*desc_pool;
 	struct virt_dma_chan		vc;
 
+	struct axi_dma_desc		*desc;
+	struct dma_slave_config		config;
+	enum dma_transfer_direction	direction;
+	bool				cyclic;
+	bool				is_err;
 	/* these other elements are all protected by vc.lock */
 	bool				is_paused;
 };
@@ -57,7 +64,7 @@ struct axi_dma_chan {
 struct dw_axi_dma {
 	struct dma_device	dma;
 	struct dw_axi_dma_hcfg	*hdata;
-	struct dma_pool		*desc_pool;
+	struct device_dma_parameters	dma_parms;
 
 	/* channels */
 	struct axi_dma_chan	*chan;
@@ -90,12 +97,20 @@ struct __packed axi_dma_lli {
 	__le32		reserved_hi;
 };
 
+struct axi_dma_hw_desc {
+	struct axi_dma_lli	*lli;
+	dma_addr_t		llp;
+	u32			len;
+};
+
 struct axi_dma_desc {
-	struct axi_dma_lli		lli;
+	struct axi_dma_hw_desc	*hw_desc;
 
 	struct virt_dma_desc		vd;
 	struct axi_dma_chan		*chan;
-	struct list_head		xfer_list;
+	u32				completed_blocks;
+	u32				length;
+	u32				period_len;
 };
 
 static inline struct device *dchan2dev(struct dma_chan *dchan)
@@ -260,6 +275,12 @@ enum {
 
 /* CH_CFG_H */
 #define CH_CFG_H_PRIORITY_POS		15
+#define CH_CFG_H_DST_HWHS_POL		6
+#define CH_CFG_H_SRC_HWHS_POL		5
+enum {
+	DWAXIDMAC_HWHS_POL_ACTIVE_HIGH	= 0,
+	DWAXIDMAC_HWHS_POL_ACTIVE_LOW
+};
 #define CH_CFG_H_HS_SEL_DST_POS		4
 #define CH_CFG_H_HS_SEL_SRC_POS		3
 enum {
@@ -282,6 +303,9 @@ enum {
 /* CH_CFG_L */
 #define CH_CFG_L_DST_MULTBLK_TYPE_POS	2
 #define CH_CFG_L_SRC_MULTBLK_TYPE_POS	0
+#define CH_CFG_L_DST_PER_POS	4
+#define CH_CFG_L_SRC_PER_POS	11
+
 enum {
 	DWAXIDMAC_MBLK_TYPE_CONTIGUOUS	= 0,
 	DWAXIDMAC_MBLK_TYPE_RELOAD,

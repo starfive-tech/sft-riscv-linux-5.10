@@ -130,6 +130,10 @@ struct sf_spdif_dev {
 	u32 fifo_th;
 	int active;
 
+	/* data related to DMA transfers b/w i2s and DMAC */
+	struct snd_dmaengine_dai_dma_data play_dma_data;
+	struct snd_dmaengine_dai_dma_data capture_dma_data;
+
 	bool use_pio;
 	struct snd_pcm_substream __rcu *tx_substream;
 	struct snd_pcm_substream __rcu *rx_substream;

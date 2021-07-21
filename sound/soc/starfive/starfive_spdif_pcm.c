@@ -83,11 +83,11 @@ static unsigned int sf_spdif_pcm_rx(struct sf_spdif_dev *dev,
 			p16[rx_ptr][0] = data[0]>>8;
 			p16[rx_ptr][1] = data[1]>>8;
 		} else if (SNDRV_PCM_FORMAT_S24_LE == format) {
-			p32[rx_ptr][0] = data[0]<<8;
-			p32[rx_ptr][1] = data[1]<<8;
-		} else if (SNDRV_PCM_FORMAT_S32_LE == format) {
 			p32[rx_ptr][0] = data[0];
 			p32[rx_ptr][1] = data[1];
+		} else if (SNDRV_PCM_FORMAT_S32_LE == format) {
+			p32[rx_ptr][0] = data[0]<<8;
+			p32[rx_ptr][1] = data[1]<<8;
 		} 
 		
 		period_pos++; 
